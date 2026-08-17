@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       rows:
-        description: "finance-alpaca subset size (small = smoke test)"
+        description: "finance-alpaca subset size (small = smoke test; 2000 = daily)"
         required: false
-        default: "5000"
+        default: "2000"
 
 permissions:
   contents: read
@@ -41,7 +41,7 @@ jobs:
           GDRIVE_ADC: ${{ secrets.GDRIVE_ADC }}
           DRIVE_ADAPTER_IN: ${{ secrets.DRIVE_ADAPTER_IN }}
           DRIVE_RESULTS: ${{ secrets.DRIVE_RESULTS }}
-          RUN_ROWS: ${{ github.event.inputs.rows || '5000' }}
+          RUN_ROWS: ${{ github.event.inputs.rows || '2000' }}
         run: python run_daily.py
 
       - name: Upload artifacts (metrics + adapter config)

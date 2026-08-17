@@ -49,16 +49,17 @@ reasons:
    incremental loop needs exactly that.
 2. **Headless reliability.** `soup train` prompts interactively; a script that
    must run unattended on a recycled VM wants zero prompts and programmatic control.
-3. **The pre-Ampere bf16 fix (Soup PR #429) is baked in** — on a T4, peft 0.19.x
-   creates bf16 LoRA adapters on a bf16 base checkpoint, and the fp16 GradScaler
-   can't unscale bf16 gradients. The script casts `lora_` params to fp32 before
-   the optimizer sees them.
+3. **The T4 needs bf16, not fp16.** On a T4 (sm_75), `fp16` mixed precision uses a
+   GradScaler whose `_amp_foreach_non_finite_check_and_unscale_cuda` kernel has no
+   bf16 path — and the LoRA gradients come out bf16 regardless of the param dtype —
+   so `soup train --fp16` crashes at `clip_grad_norm`. The script uses **bf16**
+   mixed precision (the canonical QLoRA-on-T4 recipe): no GradScaler, no crash.
 
 ### Training config (replicates Soup "v2")
 
 - **base**: `NousResearch/Meta-Llama-3.1-8B-Instruct` (NF4 QLoRA, 4-bit)
 - **LoRA**: r=16, α=32, all 7 linear layers (q,k,v,o,gate,up,down)
-- **batch** 4, **seq** 512, **lr** 2e-4 (cosine, warmup 3%), 1 epoch, fp16
+- **batch** 4, **seq** 512, **lr** 2e-4 (cosine, warmup 3%), 1 epoch, bf16
 - **resident** QLoRA (NOT layer streaming — on a 16 GB T4 resident batch-4 is
   ~135 tok/s vs ~53 tok/s streamed; streaming is for <4 GB cards or >14B models)
 
@@ -110,8 +111,8 @@ python run_daily.py
 ## Notes & limits
 
 - **Free-Colab T4** sessions recycle after ~2–3 h and the ephemeral disk is wiped;
-  the base model (~15 GB) re-downloads each run. Training is sized (5000 rows,
-  ~70–90 min) to finish inside one session.
+  the base model (~15 GB) re-downloads each run. Training is sized (2000 rows,
+  ~500 steps ≈ 90 min) to finish inside one session.
 - **Daily quota** is ~3–4 T4 sessions per account; a single run uses one.
 - The adapter is the persisted artifact; the base model always comes from
   `NousResearch` (ungated HF mirror), not Drive.

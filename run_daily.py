@@ -132,7 +132,7 @@ def main():
     adc = os.environ["GDRIVE_ADC"]
     folder_in = os.environ["DRIVE_ADAPTER_IN"]
     folder_out = os.environ["DRIVE_RESULTS"]
-    rows = os.environ.get("RUN_ROWS", "5000")
+    rows = os.environ.get("RUN_ROWS", "2000")
     seed = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
 
     # --- auth ---

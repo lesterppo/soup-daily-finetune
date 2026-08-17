@@ -105,7 +105,7 @@ def load_model_and_adapter(base: str, adapter_path: str):
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,  # T4: no bf16 hardware
+        bnb_4bit_compute_dtype=torch.bfloat16,  # standard QLoRA recipe (works on T4)
     )
     tok = AutoTokenizer.from_pretrained(base)
     if tok.pad_token is None:
@@ -115,9 +115,11 @@ def load_model_and_adapter(base: str, adapter_path: str):
         base,
         quantization_config=bnb,
         device_map="auto",
-        torch_dtype=torch.float16,
     )
-    model = prepare_model_for_kbit_training(model)
+    # NOTE: deliberately NO prepare_model_for_kbit_training() here. Soup's SFT
+    # path skips it; calling it casts the frozen bf16 base (embedding/norm/lm_head)
+    # to fp32, which then produces bf16 gradients under the fp16 autocast and
+    # crashes the fp16 GradScaler on a T4 (see Soup PR #429 / issue #425).
 
     lora_config = LoraConfig(
         r=16,
@@ -140,15 +142,16 @@ def load_model_and_adapter(base: str, adapter_path: str):
         print("[adapter] starting fresh LoRA", flush=True)
         model = get_peft_model(model, lora_config)
 
-    # Pre-Ampere fp16 fix (Soup PR #429): peft may create bf16 adapters on a bf16
-    # base checkpoint; the fp16 GradScaler can't unscale bf16 grads. Cast -> fp32.
-    cast = 0
-    for n, p in model.named_parameters():
-        if "lora_" in n and p.dtype == torch.bfloat16 and p.requires_grad:
-            p.data = p.data.to(torch.float32)
-            cast += 1
-    if cast:
-        print(f"[fix] cast {cast} bf16 lora_ params -> fp32", flush=True)
+    # bf16 mixed precision uses NO GradScaler, so no bf16-gradient unscale crash.
+    # Trainable LoRA params stay fp32 (master weights); the bf16 autocast handles
+    # the forward. (The fp16 GradScaler path crashes on a T4: peft creates bf16
+    # adapters on a bf16 base, and `_amp_foreach_non_finite_check_and_unscale_cuda`
+    # has no bf16 kernel on sm_75 — Soup PR #429 / issue #425.)
+    from collections import Counter
+    full = Counter(str(p.dtype) for p in model.parameters())
+    trainable = Counter(str(p.dtype) for p in model.parameters() if p.requires_grad)
+    print(f"[dtype] ALL params: {dict(full)}", flush=True)
+    print(f"[dtype] trainable: {dict(trainable)}", flush=True)
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[model] trainable params: {n_trainable}", flush=True)
@@ -156,15 +159,18 @@ def load_model_and_adapter(base: str, adapter_path: str):
 
 
 def train(model, tok, data_path: str, out_dir: str):
-    import torch
-    from transformers import TrainingArguments
-    from trl import SFTTrainer
+    from trl import SFTConfig, SFTTrainer
     from datasets import load_dataset
 
     ds = load_dataset("json", data_files=data_path, split="train")
     print(f"[data] loaded {len(ds)} rows", flush=True)
 
-    args = TrainingArguments(
+    def formatting_func(example):
+        return tok.apply_chat_template(
+            example["messages"], tokenize=False, add_generation_prompt=False
+        )
+
+    args = SFTConfig(
         output_dir=out_dir,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
@@ -173,22 +179,22 @@ def train(model, tok, data_path: str, out_dir: str):
         logging_steps=10,
         save_steps=200,
         save_strategy="steps",
-        fp16=True,
-        bf16=False,
-        optim="paged_adamw_8bit",
+        fp16=False,
+        bf16=True,
+        optim="adamw_torch",
         warmup_ratio=0.03,
         lr_scheduler_type="cosine",
         report_to=[],
         seed=1234,
+        max_length=512,
     )
 
     trainer = SFTTrainer(
         model=model,
         args=args,
         train_dataset=ds,
-        tokenizer=tok,
-        max_seq_length=512,
-        dataset_text_field=None,  # "messages" conversational format
+        processing_class=tok,
+        formatting_func=formatting_func,
     )
 
     print("[train] starting", flush=True)
