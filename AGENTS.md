@@ -33,10 +33,13 @@ persistent model store. No local machine is needed at run time.
    anything on the VM.
 3. **Don't layer-stream 8B on a T4.** Resident NF4 QLoRA fits (9.4 GB of 15.36 GB)
    and is ~1.6–2.6× faster. Streaming is for <4 GB cards or >14B models.
-4. **The bf16 cast is load-bearing.** On a T4, peft 0.19.x creates bf16 LoRA
-   adapters on a bf16 base checkpoint; the fp16 GradScaler crashes on bf16 grads
-   (`_amp_foreach_non_finite_check_and_unscale_cuda not implemented for BFloat16`).
-   `daily_finetune.py` casts `lora_` params to fp32 before training. Don't remove it.
+4. **On a T4, use bf16 mixed precision, NOT fp16.** `fp16` uses a GradScaler whose
+   `_amp_foreach_non_finite_check_and_unscale_cuda` kernel has no bf16 path on
+   sm_75 — and the LoRA gradients come out bf16 even when every param is fp32 — so
+   `fp16=True` crashes at `clip_grad_norm` (`...not implemented for BFloat16`).
+   `daily_finetune.py` uses `bf16=True` + `bnb_4bit_compute_dtype=torch.bfloat16`
+   (the canonical QLoRA-on-T4 recipe), which needs no GradScaler. Also skip
+   `prepare_model_for_kbit_training` (Soup's SFT path skips it too).
 
 ## Known-good dependency pins (Colab ships wrong versions)
 
