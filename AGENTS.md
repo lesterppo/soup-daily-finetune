@@ -27,7 +27,7 @@ persistent model store. No local machine is needed at run time.
 1. **Never commit credentials.** All secrets are GitHub-encrypted and passed via
    env vars. `.gitignore` excludes every credential path (`*.json`, token files).
    If you add code, grep for `client_secret`, `refresh_token`, `access_token`,
-   `764086051850`, email addresses, or `/home/` paths before committing.
+   client-id strings, email addresses, or `/home/` paths before committing.
 2. **Colab free tier is ephemeral.** Assume the VM is recycled after ~2–3 h and
    `/content` is wiped. The persisted artifact is the adapter on Drive, not
    anything on the VM.
@@ -62,7 +62,7 @@ The script installs the pins Soup verified:
   with `gdown --folder` on the VM instead of uploading it.
 - **`gdown --folder` needs the folder shared anyone-with-link** (`gdrive share <id>
   --type anyone --role reader`), and it downloads all non-trashed files.
-- **Refresh tokens are long-lived** (gcloud client 764086051850 is production, not
+- **Refresh tokens are long-lived** (the gcloud OAuth client is production, not
   testing), so the headless OAuth refresh in `run_daily.py` works indefinitely
   until the user revokes access.
 - **Colab daily GPU quota** is ~3–4 T4 sessions/account. A stuck/failed run that

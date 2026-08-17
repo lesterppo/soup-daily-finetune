@@ -18,7 +18,7 @@ Secrets come from environment variables (set by the workflow from GitHub
 secrets). None are ever committed to the repo.
 
 Environment:
-  COLAB_CLIENT_ID         OAuth client id (gcloud client 764086051850-*)
+  COLAB_CLIENT_ID         OAuth client id (gcloud "Desktop" OAuth client)
   COLAB_CLIENT_SECRET     OAuth client secret
   COLAB_REFRESH_TOKEN     long-lived refresh token (colaboratory + drive.file scope)
   GDRIVE_ADC              full gcloud ADC JSON (authorized_user) for Drive
