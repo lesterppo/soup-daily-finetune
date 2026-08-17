@@ -32,9 +32,22 @@ dated archive of every daily checkpoint on Drive.
 |---|---|---|
 | Orchestrator | `run_daily.py` | GitHub Actions runner (headless) |
 | Training script | `daily_finetune.py` | free Colab T4 (GPU) |
+| **VM-side auto-ship** | `ship_to_drive.py` | free Colab T4 (GPU) |
 | Colab driver | `colab.py` (v3.2) | GitHub Actions runner |
 | Drive client | `gdrive.py` | GitHub Actions runner |
 | Scheduler | `.github/workflows/daily-finetune.yml` | GitHub Actions |
+
+### VM-side auto-ship (`ship_to_drive.py`) — belt and suspenders
+
+The orchestrator (`run_daily.py`) downloads the result and uploads it to Drive.
+As a redundant safety net, `ship_to_drive.py` runs **on the VM itself**: it waits
+for `daily_finetune.py` to finish, then uploads the adapter + config + metrics
+straight to `results/manual_<timestamp>/` on Drive using the same `gdrive.py` +
+gcloud-ADC (server-side refresh-token) auth. This guarantees the model is saved
+even if the GitHub Actions runner or the machine that launched the session dies
+mid-run. `colabctl exec_detach -f ship_to_drive.py --log /content/ship.log` is the
+launch pattern; it survives the launching machine being powered off because it is
+a detached process on the Colab VM.
 
 ### Why not the Soup CLI for the daily loop?
 
