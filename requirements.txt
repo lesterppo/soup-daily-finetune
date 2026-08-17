@@ -1,0 +1,7 @@
+# Runtime deps for the headless daily fine-tune (GitHub Actions runner).
+google-colab-cli>=0.6.0
+google-auth>=2.0
+google-auth-oauthlib>=1.0
+google-auth-httplib2>=0.1
+google-api-python-client>=2.0
+requests>=2.0

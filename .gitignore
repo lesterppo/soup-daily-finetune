@@ -1,0 +1,17 @@
+# Local / transient
+__pycache__/
+*.pyc
+out/
+*.safetensors
+*.pt
+*.bin
+
+# Credentials — NEVER commit these
+*.json
+!package.json
+token.json
+application_default_credentials.json
+
+# Env / secrets
+.env
+.env.*
