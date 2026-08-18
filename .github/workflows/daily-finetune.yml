@@ -19,9 +19,13 @@ on:
         required: false
         default: "100"
       train_timeout:
-        description: "Runner poll budget in minutes (default: max_minutes + 25)"
+        description: "Runner poll budget in minutes (default: max_minutes + 25; unlimited mode: 240)"
         required: false
         default: ""
+      epochs:
+        description: "Training epochs per run (default 1). Use >1 with max_minutes=0 to train until the VM is recycled (~12h window)."
+        required: false
+        default: "1"
 
 permissions:
   contents: read
@@ -33,9 +37,10 @@ concurrency:
 jobs:
   finetune:
     runs-on: ubuntu-latest
-    # Must cover setup (~12 min) + max_minutes of training + slack; default
-    # inputs (100 min) fit in 200, but a full-window run (150+) needs more.
-    timeout-minutes: 300
+    # Runner budget: setup (~12 min) + max_minutes of training + slack; for
+    # unlimited runs (max_minutes=0) the runner observes up to TRAIN_TIMEOUT_MIN
+    # (default 240) then exits leaving the VM training. 400 covers the max.
+    timeout-minutes: 400
     steps:
       - uses: actions/checkout@v6
 
@@ -75,6 +80,7 @@ jobs:
           RUN_ROWS: ${{ github.event.inputs.rows || '2000' }}
           RUN_SAVE_STEPS: ${{ github.event.inputs.save_steps || '100' }}
           RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '100' }}
+          RUN_EPOCHS: ${{ github.event.inputs.epochs || '1' }}
           # Optional runner poll budget override in MINUTES (default in
           # run_daily.py: max_minutes + 25). Must outlive the VM's setup
           # (~12 min) + training, else the runner times out first.

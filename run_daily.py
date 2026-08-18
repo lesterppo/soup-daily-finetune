@@ -60,16 +60,21 @@ COLAB_PY = str(REPO / "colab.py")
 GDRIVE_PY = str(REPO / "gdrive.py")
 SESSION = "soup-daily"
 
-# Colab free-tier sessions recycle after ~2-3h; the VM self-stops after
-# RUN_MAX_MINUTES of training (default 100) so a full run fits well inside.
-# The runner's poll budget must OUTLIVE the VM's setup (~12 min) + training,
-# else the runner declares timeout while the VM is still training fine.
+# Colab free-tier sessions recycle after ~2-3h (some last up to 12h); the VM
+# self-stops after RUN_MAX_MINUTES of training (default 100) so a full run fits
+# well inside. The runner's poll budget must OUTLIVE the VM's setup (~12 min) +
+# training, else the runner declares timeout while the VM is still training.
 # Default: max_minutes + 25 (setup slack). Override via TRAIN_TIMEOUT_MIN.
+# In UNLIMITED mode (max_minutes=0) there is no self-stop — the VM trains until
+# Colab recycles it — so the runner observes a fixed window (default 240 min)
+# to confirm checkpoints are flowing, then leaves the session running.
 def train_timeout_s():
     ov = os.environ.get("TRAIN_TIMEOUT_MIN", "")
     if ov.strip():
         return int(float(ov)) * 60
     mm = int(os.environ.get("RUN_MAX_MINUTES", "100"))
+    if mm <= 0:
+        return 240 * 60
     return (mm + 25) * 60
 
 
@@ -224,6 +229,8 @@ def main():
     rows = os.environ.get("RUN_ROWS", "2000")
     save_steps = os.environ.get("RUN_SAVE_STEPS", "100")
     max_minutes = os.environ.get("RUN_MAX_MINUTES", "100")
+    epochs = os.environ.get("RUN_EPOCHS", "1")
+    unlimited = max_minutes.strip() in ("", "0")
     seed = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
     # UNIQUE run id (date+time): same-day re-runs must write into their OWN
     # checkpoint folder. With a date-only run_id two runs collide on the same
@@ -293,6 +300,7 @@ cmd = [sys.executable, '/content/daily_finetune.py',
        '--run-id', '{run_id}',
        '--save-steps', '{save_steps}',
        '--max-minutes', '{max_minutes}',
+       '--epochs', '{epochs}',
        '--out', '/content/out']
 print('LAUNCH ' + ' '.join(cmd), flush=True)
 r = subprocess.run(cmd)
@@ -312,6 +320,18 @@ sys.exit(r.returncode)
     log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s")
     final = poll_log(deadline)
     if final is None:
+        if unlimited:
+            # max_minutes=0: the VM self-stops only when the Colab session is
+            # recycled (~12h). The runner's poll budget is finite, so when it
+            # expires we LEAVE THE SESSION RUNNING — training continues
+            # detached on the VM, and the Drive checkpoints keep flowing.
+            log("UNLIMITED MODE: runner poll budget reached; training continues detached on the VM")
+            log("leaving session RUNNING — checkpoints keep being pushed to Drive until VM recycle")
+            recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+            log("latest Drive checkpoint recovered into adapter_in (next run resumes from real progress)")
+            log("DONE (unlimited mode — session NOT stopped)")
+            print("\n[run_daily] SUCCESS — training continues detached; Drive checkpoints accumulating", flush=True)
+            return
         log("TIMEOUT: training did not finish in time (Colab may have recycled the session)")
         # The VM pushes checkpoints to Drive as it trains — recover the newest
         # one so the next run resumes from real progress, not the pre-run adapter.

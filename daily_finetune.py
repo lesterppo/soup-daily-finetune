@@ -380,7 +380,7 @@ def load_model_and_adapter(base: str, adapter_path: str):
 
 
 def train(model, tok, data_path: str, out_dir: str, save_steps: int,
-          max_minutes: int, drive, run_folder):
+          max_minutes: int, epochs: int, drive, run_folder):
     from trl import SFTConfig, SFTTrainer
     from datasets import load_dataset
     from transformers import TrainerCallback
@@ -430,7 +430,7 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
         output_dir=out_dir,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
-        num_train_epochs=1,
+        num_train_epochs=epochs,
         learning_rate=2e-4,
         logging_steps=10,
         save_steps=save_steps,
@@ -522,6 +522,8 @@ def main():
     ap.add_argument("--save-steps", type=int, default=100)
     ap.add_argument("--max-minutes", type=int, default=100,
                     help="stop training after N minutes and save a final checkpoint (0 = unlimited)")
+    ap.add_argument("--epochs", type=int, default=1,
+                    help="epochs per run; >1 keeps training until the VM is recycled (12h window)")
     args = ap.parse_args()
 
     if not args.skip_install:
@@ -556,7 +558,7 @@ def main():
     build_data(args.rows, args.seed, "/content/finance_train.jsonl")
     model, tok = load_model_and_adapter(args.base, args.adapter)
     metrics = train(model, tok, "/content/finance_train.jsonl", args.out,
-                    args.save_steps, args.max_minutes, drive, run_folder)
+                    args.save_steps, args.max_minutes, args.epochs, drive, run_folder)
     ok = verify_adapter(args.out)
 
     # --- Drive continuity: archive + update the 'latest adapter' pointer ---

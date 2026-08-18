@@ -26,14 +26,20 @@ GitHub Actions (daily cron) ──► Google Colab T4 (train) ──► Google D
 6. **Every `--save-steps` training steps, the VM pushes a checkpoint to Drive**
    (`results/checkpoints/<run-id>/step-<n>-...`, keeping the newest 2). This is
    the timeout/recycle safety net: a free-Colab session is recycled after
-   ~2-3 h and the ephemeral disk is wiped, but the latest checkpoint is already
-   on Drive, so a killed run loses at most `save_steps` of work.
+   ~2-3h (up to 12h), but the latest checkpoint is already on Drive, so a
+   killed run loses at most `save_steps` of work.
 7. When training ends (naturally or via the `--max-minutes` budget), the VM
    archives the final adapter under `results/<date>/`, updates the `adapter_in/`
    continuity pointer, and reports `[RESULT]`. The orchestrator downloads the
    result for the GH artifact tab and stops the session. On runner timeout it
    pulls the newest Drive checkpoint into `adapter_in/` so the next day resumes
    from real progress.
+8. **Unlimited mode** (`max_minutes=0`, e.g. `epochs=4`): the VM has no
+   self-stop — it trains continuously until Colab recycles the session (~12h),
+   checkpointing to Drive every `save_steps`. The runner observes a fixed
+   window (default 240 min) to confirm checkpoints are flowing, then **exits
+   leaving the session running** — training continues detached on the VM and
+   the next run resumes from the newest checkpoint.
 
 The result is a **continually improving** financial-domain LoRA adapter, with a
 dated archive of every daily checkpoint on Drive — resilient to GitHub Actions
