@@ -41,6 +41,23 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: Patch jupyter-kernel-client compat (colab-cli 0.6.0 bug)
+        # google-colab-cli 0.6.0's runtime.py calls jupyter_kernel_client.KernelClient,
+        # renamed to JupyterKernelClient in jupyter-kernel-client 1.0.0 -> AttributeError
+        # on exec_detach. Same sed fix Peter applies locally via ~/colab_cli_patched.
+        run: |
+          python - <<'EOF'
+          import pathlib, colab_cli.runtime
+          p = pathlib.Path(colab_cli.runtime.__file__)
+          src = p.read_text()
+          fixed = src.replace("jupyter_kernel_client.KernelClient(", "jupyter_kernel_client.JupyterKernelClient(")
+          if fixed != src:
+              p.write_text(fixed)
+              print(f"patched {p}: KernelClient -> JupyterKernelClient")
+          else:
+              print(f"{p}: no patch needed")
+          EOF
+
       - name: Run daily fine-tune
         env:
           COLAB_CLIENT_ID: ${{ secrets.COLAB_CLIENT_ID }}
