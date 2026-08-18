@@ -18,6 +18,10 @@ on:
         description: "Stop training after N minutes and save a final checkpoint (0 = unlimited)"
         required: false
         default: "100"
+      train_timeout:
+        description: "Runner poll budget in minutes (default: max_minutes + 25)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -29,7 +33,9 @@ concurrency:
 jobs:
   finetune:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
+    # Must cover setup (~12 min) + max_minutes of training + slack; default
+    # inputs (100 min) fit in 200, but a full-window run (150+) needs more.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v6
 
@@ -69,6 +75,10 @@ jobs:
           RUN_ROWS: ${{ github.event.inputs.rows || '2000' }}
           RUN_SAVE_STEPS: ${{ github.event.inputs.save_steps || '100' }}
           RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '100' }}
+          # Optional runner poll budget override in MINUTES (default in
+          # run_daily.py: max_minutes + 25). Must outlive the VM's setup
+          # (~12 min) + training, else the runner times out first.
+          TRAIN_TIMEOUT_MIN: ${{ github.event.inputs.train_timeout }}
         run: python run_daily.py
 
       - name: Upload artifacts (metrics + adapter config)

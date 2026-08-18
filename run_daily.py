@@ -62,8 +62,18 @@ SESSION = "soup-daily"
 
 # Colab free-tier sessions recycle after ~2-3h; the VM self-stops after
 # RUN_MAX_MINUTES of training (default 100) so a full run fits well inside.
-# Give the runner enough slack to cover model download + setup + polling.
-TRAIN_TIMEOUT_S = int(os.environ.get("TRAIN_TIMEOUT_S", "9600"))
+# The runner's poll budget must OUTLIVE the VM's setup (~12 min) + training,
+# else the runner declares timeout while the VM is still training fine.
+# Default: max_minutes + 25 (setup slack). Override via TRAIN_TIMEOUT_MIN.
+def train_timeout_s():
+    ov = os.environ.get("TRAIN_TIMEOUT_MIN", "")
+    if ov.strip():
+        return int(float(ov)) * 60
+    mm = int(os.environ.get("RUN_MAX_MINUTES", "100"))
+    return (mm + 25) * 60
+
+
+TRAIN_TIMEOUT_S = train_timeout_s()
 
 
 def log(msg):
