@@ -218,11 +218,21 @@ def main():
     if rc != 0:
         log(f"gdrive about FAILED (continuing, will retry on upload): {err[-300:]}")
 
-    # --- session ---
-    rc, out, err = colab("new", "-s", SESSION, "--gpu", "T4", timeout=300)
-    log(f"new session: rc={rc} {out[-200:]} {err[-200:]}")
+    # --- session (retry on transient quota exhaustion: free T4 quota is
+    # ~3-4 sessions/account/day and `gpu-unavailable` is common at peak) ---
+    rc, out, err = 1, "", ""
+    for attempt in range(4):
+        rc, out, err = colab("new", "-s", SESSION, "--gpu", "T4", timeout=300)
+        log(f"new session attempt {attempt+1}: rc={rc} {out[-200:]} {err[-200:]}")
+        if rc == 0:
+            break
+        if "gpu-unavailable" in str(out) + str(err) and attempt < 3:
+            log("GPU quota exhausted — waiting 600s before retry")
+            time.sleep(600)
+        else:
+            break
     if rc != 0:
-        raise SystemExit(f"failed to create T4 session: {err[-500:]}")
+        raise SystemExit(f"failed to create T4 session: {str(out)[-500:] or str(err)[-500:]}")
 
     # --- upload training script + Drive tooling to the VM ---
     for local, remote in [
