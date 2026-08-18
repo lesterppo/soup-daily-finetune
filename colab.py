@@ -386,6 +386,10 @@ def cmd_exec_detach(args):
     This is THE way to launch long-running servers (llama.cpp, FastAPI, tunnels).
     Unlike exec (which blocks) or exec_bg (which runs Code as exec text),
     this uploads a script and runs it as a proper background process.
+
+    Freshly-created GPU sessions boot slowly: the kernel may not be ready for
+    30-60s, and an exec issued too early fails with an opaque error. We wait
+    for kernel readiness first, then retry the launch a few times.
     """
     _pre_auth_check()
     s = _resolve_session(args) or args.session
@@ -420,7 +424,22 @@ def cmd_exec_detach(args):
     else:
         die("exec-detach-no-code", "Provide --file LOCAL or --code ...")
 
-    # Launch detached on VM
+    # Wait for kernel readiness (fresh GPU sessions boot slowly). A trivial
+    # exec succeeds only once the kernel can run code.
+    ready = False
+    last_err = ""
+    for attempt in range(8):
+        stdout, stderr, rc = _remote_pexec(s, "print('KERNEL_READY')", timeout=20)
+        last_err = stderr or ""
+        if rc == 0 and "KERNEL_READY" in stdout:
+            ready = True
+            break
+        time.sleep(10)
+    if not ready:
+        die("exec-detach-kernel-not-ready",
+            f"kernel did not become ready after retries: {last_err[-300:]}")
+
+    # Launch detached on VM (retry: transient kernel/network hiccups)
     launch_code = (
         "import subprocess, sys, os\n"
         "p = subprocess.Popen(\n"
@@ -431,7 +450,12 @@ def cmd_exec_detach(args):
         "print(f'PID:{p.pid}|SESSION:%s|LOG:%s|SCRIPT:%s')"
     ) % (remote_path, log_file, work_dir, s, log_file, remote_path)
 
-    stdout, stderr, rc = _remote_pexec(s, launch_code, timeout=15)
+    stdout, stderr, rc = "", "", -1
+    for attempt in range(4):
+        stdout, stderr, rc = _remote_pexec(s, launch_code, timeout=20)
+        if rc == 0 and "PID:" in stdout:
+            break
+        time.sleep(8)
     if rc == 0 and "PID:" in stdout:
         info = {}
         for part in stdout.strip().split("|"):
@@ -447,7 +471,7 @@ def cmd_exec_detach(args):
             "monitor": f"python3 ~/.hermes/scripts/colab/colab.py logs -s {s} {log_file.replace('/content/', '/content/')} -f"
         })
     else:
-        die("exec-detach-failed", stdout.strip())
+        die("exec-detach-failed", (stdout or stderr or "").strip()[-400:])
 
 
 # ── P1: exec_file — upload + exec in one step ─────────────────────────────

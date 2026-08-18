@@ -259,8 +259,12 @@ print('EXIT ' + str(r.returncode), flush=True)
 sys.exit(r.returncode)
 """)
     rc, out, err = colab("exec_detach", "-s", SESSION, "-f", str(launcher),
-                         "--log", "/content/train.log", timeout=180)
-    log(f"exec_detach: rc={rc} {out[-120:]} {err[-120:]}")
+                         "--log", "/content/train.log", timeout=300)
+    log(f"exec_detach: rc={rc} {out[-200:]} {err[-200:]}")
+    if rc != 0:
+        # Don't poll a log that will never appear — fail fast with the error.
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit(f"exec_detach failed (session stopped): {out[-400:] or err[-400:]}")
 
     # --- poll ---
     deadline = time.time() + TRAIN_TIMEOUT_S
