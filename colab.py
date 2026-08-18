@@ -44,13 +44,37 @@ def _find_colab():
 COLAB = _find_colab()
 
 # The installed `colab` script may shebang to a broken python (e.g. a venv
-# with mismatched pydantic_core). Prefer invoking the package via a working
-# system python: `/usr/bin/python3 -m colab_cli.cli`.
-COLAB_PY = None
-for cand in ("/usr/bin/python3", "/usr/bin/python"):
-    if os.path.exists(cand):
-        COLAB_PY = cand
-        break
+# with mismatched pydantic_core). Prefer invoking the package via a python
+# that can actually `import colab_cli`: the current interpreter first (on a
+# GH Actions runner, `pip install -r requirements.txt` puts google-colab-cli
+# into setup-python's sys.executable, NOT /usr/bin/python3), then the system
+# pythons. Probing avoids the old hardcoded /usr/bin/python3 trap that broke
+# headless runs with ModuleNotFoundError: No module named 'colab_cli'.
+def _probe_colab_py():
+    candidates = [sys.executable, "/usr/bin/python3", "/usr/bin/python"]
+    seen = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        if not os.path.exists(cand):
+            continue
+        try:
+            r = subprocess.run([cand, "-c", "import colab_cli"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return cand
+        except Exception:
+            continue
+    # fallback: first existing candidate (old behavior; will surface a clear
+    # ModuleNotFoundError if colab_cli truly is not installed anywhere)
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
+COLAB_PY = _probe_colab_py()
 
 # Patched shadow copy (created by `colabctl patch` when the installed package
 # is root-owned): prefer it so the 401/404 -> refresh-token fix is active.

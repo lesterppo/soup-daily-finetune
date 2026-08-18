@@ -15,16 +15,28 @@ GitHub Actions (daily cron) ──► Google Colab T4 (train) ──► Google D
 2. It mints a Colab access token from a stored refresh token (server-side OAuth,
    no browser), and loads Drive credentials the same way.
 3. It spins up a fresh free-Colab T4 session and runs `daily_finetune.py`.
-4. The VM pulls the **current** LoRA adapter from Google Drive (`gdown --folder`),
-   continues fine-tuning it on a fresh `gbharti/finance-alpaca` subset (seed =
-   today's date, so each day trains on a different shuffle), and saves the updated
-   adapter.
-5. The orchestrator downloads the result and uploads it to Drive twice: a dated
-   archive (`results/<date>/`) and the `adapter_in/` folder that tomorrow's run
-   continues from.
+4. The VM **mounts Google Drive itself** (vendored `gdrive.py` + the gcloud ADC
+   JSON, uploaded alongside the training script — headless, no browser) and
+   resumes from the **newest Drive checkpoint** found under
+   `results/checkpoints/` (falling back to the shared `adapter_in/` folder via
+   `gdown --folder` on the first run).
+5. Training continues fine-tuning on a fresh `gbharti/finance-alpaca` subset
+   (seed = today's date, so each day trains on a different shuffle).
+6. **Every `--save-steps` training steps, the VM pushes a checkpoint to Drive**
+   (`results/checkpoints/<run-id>/step-<n>-...`, keeping the newest 2). This is
+   the timeout/recycle safety net: a free-Colab session is recycled after
+   ~2-3 h and the ephemeral disk is wiped, but the latest checkpoint is already
+   on Drive, so a killed run loses at most `save_steps` of work.
+7. When training ends (naturally or via the `--max-minutes` budget), the VM
+   archives the final adapter under `results/<date>/`, updates the `adapter_in/`
+   continuity pointer, and reports `[RESULT]`. The orchestrator downloads the
+   result for the GH artifact tab and stops the session. On runner timeout it
+   pulls the newest Drive checkpoint into `adapter_in/` so the next day resumes
+   from real progress.
 
 The result is a **continually improving** financial-domain LoRA adapter, with a
-dated archive of every daily checkpoint on Drive.
+dated archive of every daily checkpoint on Drive — resilient to GitHub Actions
+timeouts, runner death, and Colab session recycling.
 
 ## Architecture
 
@@ -34,8 +46,21 @@ dated archive of every daily checkpoint on Drive.
 | Training script | `daily_finetune.py` | free Colab T4 (GPU) |
 | **VM-side auto-ship** | `ship_to_drive.py` | free Colab T4 (GPU) |
 | Colab driver | `colab.py` (v3.2) | GitHub Actions runner |
-| Drive client | `gdrive.py` | GitHub Actions runner |
+| Drive client | `gdrive.py` | GitHub Actions runner **and** Colab VM |
 | Scheduler | `.github/workflows/daily-finetune.yml` | GitHub Actions |
+
+### VM-side Drive checkpointing (the timeout/recycle safety net)
+
+`daily_finetune.py` mounts Google Drive **on the VM** (vendored `gdrive.py` +
+the ADC JSON the orchestrator uploads; headless refresh-token OAuth, no
+browser). A `TrainerCallback` pushes a checkpoint to
+`results/checkpoints/<run-id>/step-<n>-adapter_model.safetensors` after every
+`--save-steps` training steps and prunes to the newest 2. On startup it scans
+all run folders under `results/checkpoints/` and resumes from the globally
+newest step. `--max-minutes` (default 100) makes the VM stop cleanly before the
+free-tier session recycle window and push a final checkpoint — so neither a
+GitHub Actions timeout (`timeout-minutes: 200`) nor a Colab recycle can lose
+more than `save_steps` steps of work.
 
 ### VM-side auto-ship (`ship_to_drive.py`) — belt and suspenders
 

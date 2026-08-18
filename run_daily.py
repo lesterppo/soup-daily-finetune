@@ -6,13 +6,23 @@ Runs inside GitHub Actions (no local machine involved). It:
   1. Mints a Colab access token from a stored refresh token (server-side OAuth,
      no browser).
   2. Writes the colab-cli token.json and the gdrive ADC credentials.
-  3. Creates a free Colab T4 session, uploads daily_finetune.py, and launches
-     training detached.
+  3. Creates a free Colab T4 session, uploads daily_finetune.py + the vendored
+     gdrive.py + the ADC JSON, and launches training detached.
   4. Polls the VM log until the run reports [RESULT] (or times out).
-  5. Downloads the new adapter + metrics, uploads them to Google Drive
-     (a dated archive folder AND the "latest" adapter_in folder the next day
-     continues from).
+  5. On success: downloads the new adapter + metrics for the GH artifact tab
+     (Drive continuity is already handled BY THE VM — see below).
   6. Stops the session.
+
+DRIVE CONTINUITY (why timeouts no longer lose work):
+  daily_finetune.py mounts Drive itself (vendored gdrive.py + the ADC JSON we
+  upload) and pushes a checkpoint to Drive after every --save-steps training
+  steps, plus a final checkpoint + archive + adapter_in update when the run
+  ends (naturally or via its --max-minutes budget). So even if THIS runner
+  times out or the Colab session is recycled mid-training, the newest
+  checkpoint already lives on Drive and the next day's run resumes from it.
+  On runner timeout we additionally pull the newest Drive checkpoint into the
+  adapter_in folder so continuity is preserved even if the VM died before its
+  final push.
 
 Secrets come from environment variables (set by the workflow from GitHub
 secrets). None are ever committed to the repo.
@@ -23,8 +33,10 @@ Environment:
   COLAB_REFRESH_TOKEN     long-lived refresh token (colaboratory + drive.file scope)
   GDRIVE_ADC              full gcloud ADC JSON (authorized_user) for Drive
   DRIVE_ADAPTER_IN        Drive folder id for the "latest" adapter (shared, gdown pulls it)
-  DRIVE_RESULTS           Drive folder id for dated result archives
+  DRIVE_RESULTS           Drive folder id for dated result archives + checkpoints/
   RUN_ROWS                finance-alpaca subset size per day (default 5000)
+  RUN_SAVE_STEPS          checkpoint every N training steps (default 100)
+  RUN_MAX_MINUTES         stop training after N minutes, save final checkpoint (default 100)
 """
 import datetime
 import json
@@ -36,6 +48,11 @@ import time
 import urllib.parse
 import urllib.request
 
+# run_daily.py lives in the same repo as daily_finetune.py — reuse its Drive
+# wrapper + checkpoint discovery instead of duplicating Drive logic.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from daily_finetune import Drive, find_latest_checkpoint  # noqa: E402
+
 TOKEN_FILE = pathlib.Path.home() / ".config" / "colab-cli" / "token.json"
 ADC_FILE = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
 REPO = pathlib.Path(__file__).resolve().parent
@@ -43,9 +60,10 @@ COLAB_PY = str(REPO / "colab.py")
 GDRIVE_PY = str(REPO / "gdrive.py")
 SESSION = "soup-daily"
 
-# Colab free-tier session lifetime is ~2-3h; give training 100 min before we
-# declare failure (base-model download is ~8 min, then ~90 min of training).
-TRAIN_TIMEOUT_S = int(os.environ.get("TRAIN_TIMEOUT_S", "6600"))
+# Colab free-tier sessions recycle after ~2-3h; the VM self-stops after
+# RUN_MAX_MINUTES of training (default 100) so a full run fits well inside.
+# Give the runner enough slack to cover model download + setup + polling.
+TRAIN_TIMEOUT_S = int(os.environ.get("TRAIN_TIMEOUT_S", "9600"))
 
 
 def log(msg):
@@ -124,6 +142,50 @@ def poll_log(deadline, needle="[RESULT]"):
     return None
 
 
+def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
+    """Pull the newest Drive checkpoint into the adapter_in continuity folder.
+    Called on runner timeout / VM death so the next run resumes from the last
+    saved checkpoint instead of the pre-run adapter."""
+    try:
+        drive = Drive(GDRIVE_PY, str(ADC_FILE))
+        found = find_latest_checkpoint(drive, os.environ.get("DRIVE_RESULTS", ""), run_id)
+        if not found:
+            log("no Drive checkpoint found to recover")
+            return False
+        folder_id, step, file_id, file_name = found
+        tmp = pathlib.Path("/tmp/ckpt_recover")
+        tmp.mkdir(exist_ok=True)
+        adapter = tmp / "adapter_model.safetensors"
+        drive.download(file_id, str(adapter))
+        cfg = tmp / "adapter_config.json"
+        if not cfg.exists():
+            for f in drive.list_files(folder_id):
+                if f.get("n") == "adapter_config.json":
+                    drive.download(f.get("id"), str(cfg))
+                    break
+        if not (adapter.exists() and adapter.stat().st_size > 0):
+            log("recovered adapter file is empty/missing")
+            return False
+        # replace adapter_in contents
+        rc, o, e = gdrive("list", "--folder", folder_in, "--max", "50", timeout=120)
+        items = []
+        try:
+            data = json.loads(o or "{}")
+            items = data.get("items", []) if isinstance(data, dict) and isinstance(data.get("items"), list) else []
+        except Exception:
+            items = []
+        for it in items:
+            gdrive("rm", it.get("id", ""), timeout=120) if isinstance(it, dict) and it.get("id") else None
+        gdrive("upload", str(adapter), "--parent", folder_in, "--name", "adapter_model.safetensors", timeout=300)
+        if cfg.exists():
+            gdrive("upload", str(cfg), "--parent", folder_in, "--name", "adapter_config.json", timeout=120)
+        log(f"recovered checkpoint step-{step} -> adapter_in (next run resumes from it)")
+        return True
+    except Exception as e:
+        log(f"checkpoint recovery failed: {e}")
+        return False
+
+
 def main():
     # --- secrets ---
     cid = os.environ["COLAB_CLIENT_ID"]
@@ -133,7 +195,10 @@ def main():
     folder_in = os.environ["DRIVE_ADAPTER_IN"]
     folder_out = os.environ["DRIVE_RESULTS"]
     rows = os.environ.get("RUN_ROWS", "2000")
+    save_steps = os.environ.get("RUN_SAVE_STEPS", "100")
+    max_minutes = os.environ.get("RUN_MAX_MINUTES", "100")
     seed = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    run_id = seed
 
     # --- auth ---
     tok = mint_access_token(cid, csec, cref)
@@ -147,11 +212,11 @@ def main():
                      int(tok.get("expires_in", 3599)) - 60)
     write_adc_file(adc)
 
-    # --- sanity: gdrive works headlessly ---
+    # --- sanity: gdrive works headlessly (ADC can be inline JSON or path) ---
     rc, out, err = gdrive("about", timeout=120)
-    log(f"gdrive about: rc={rc} {out[:120]}")
+    log(f"gdrive about: rc={rc} {out[:160]}")
     if rc != 0:
-        log(f"gdrive about FAILED: {err[-500:]}")
+        log(f"gdrive about FAILED (continuing, will retry on upload): {err[-300:]}")
 
     # --- session ---
     rc, out, err = colab("new", "-s", SESSION, "--gpu", "T4", timeout=300)
@@ -159,12 +224,20 @@ def main():
     if rc != 0:
         raise SystemExit(f"failed to create T4 session: {err[-500:]}")
 
-    # --- upload training script ---
-    rc, out, err = colab("upload", "-s", SESSION,
-                         str(REPO / "daily_finetune.py"), "/content/daily_finetune.py",
-                         timeout=180)
+    # --- upload training script + Drive tooling to the VM ---
+    for local, remote in [
+        (str(REPO / "daily_finetune.py"), "/content/daily_finetune.py"),
+        (str(REPO / "gdrive.py"), "/content/gdrive.py"),
+    ]:
+        rc, o, e = colab("upload", "-s", SESSION, local, remote, timeout=180)
+        if rc != 0:
+            raise SystemExit(f"upload {local} failed: {e[-500:]}")
+    # ADC JSON as a file on the VM (gdrive.py GDRIVE_ADC=path form)
+    adc_local = pathlib.Path("/tmp/gdrive_adc.json")
+    adc_local.write_text(adc)
+    rc, o, e = colab("upload", "-s", SESSION, str(adc_local), "/content/gdrive_adc.json", timeout=180)
     if rc != 0:
-        raise SystemExit(f"upload failed: {err[-500:]}")
+        raise SystemExit(f"upload ADC failed: {e[-500:]}")
 
     # --- write + launch launcher (detached, logs to /content/train.log) ---
     launcher = pathlib.Path("/tmp/launch_daily.py")
@@ -172,7 +245,14 @@ def main():
 cmd = [sys.executable, '/content/daily_finetune.py',
        '--rows', '{rows}', '--seed', '{seed}',
        '--adapter-from-drive', '{folder_in}',
-       '--out', '/content/out', '--skip-install']
+       '--adapter-out', '{folder_in}',
+       '--drive-results', '{folder_out}',
+       '--gdrive-py', '/content/gdrive.py',
+       '--adc-file', '/content/gdrive_adc.json',
+       '--run-id', '{run_id}',
+       '--save-steps', '{save_steps}',
+       '--max-minutes', '{max_minutes}',
+       '--out', '/content/out']
 print('LAUNCH ' + ' '.join(cmd), flush=True)
 r = subprocess.run(cmd)
 print('EXIT ' + str(r.returncode), flush=True)
@@ -187,12 +267,15 @@ sys.exit(r.returncode)
     log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s")
     final = poll_log(deadline)
     if final is None:
-        log("TIMEOUT: training did not finish in time")
+        log("TIMEOUT: training did not finish in time (Colab may have recycled the session)")
+        # The VM pushes checkpoints to Drive as it trains — recover the newest
+        # one so the next run resumes from real progress, not the pre-run adapter.
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
         colab("stop", "-s", SESSION, timeout=120)
-        raise SystemExit("training timed out (session likely recycled)")
+        raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
     log(f"training finished:\n{final[-1200:]}")
 
-    # --- download results ---
+    # --- download results (best-effort; Drive continuity is already done by VM) ---
     outdir = pathlib.Path("out")
     outdir.mkdir(exist_ok=True)
     results = {}
@@ -205,42 +288,13 @@ sys.exit(r.returncode)
         results[local] = rc == 0 and pathlib.Path(local).exists()
         log(f"download {local}: rc={rc} exists={results[local]}")
     if not results["out/adapter_model.safetensors"]:
-        colab("stop", "-s", SESSION, timeout=120)
-        raise SystemExit("adapter download failed")
+        log("WARNING: adapter download failed — VM already pushed it to Drive (adapter_in + archive)")
 
     # --- stop session (free tier: don't leave it idle) ---
     colab("stop", "-s", SESSION, timeout=120)
 
-    # --- upload to Drive ---
-    date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-    # archive under results/<date>/
-    rc, o, e = gdrive("mkdir", f"results-{date}", "--parent", folder_out, timeout=120)
-    archive = None
-    try:
-        archive = json.loads(o).get("id")
-    except Exception:
-        log(f"mkdir archive failed: {o[:200]} {e[:200]}")
-    if archive:
-        for name in ["adapter_model.safetensors", "adapter_config.json", "metrics.json"]:
-            if pathlib.Path("out", name).exists():
-                gdrive("upload", f"out/{name}", "--parent", archive, "--name", name, timeout=300)
-
-    # update the "latest" adapter_in folder: trash existing files, upload new ones.
-    # (gdown --folder pulls whatever non-trashed files remain, so the next day's
-    #  run continues from today's adapter.)
-    rc, o, e = gdrive("list", "--folder", folder_in, "--max", "50", timeout=120)
-    try:
-        items = json.loads(o).get("items", [])
-    except Exception:
-        items = []
-    for it in items:
-        gdrive("rm", it["id"], timeout=120)  # trash (recoverable), not permanent
-    for name in ["adapter_model.safetensors", "adapter_config.json"]:
-        gdrive("upload", f"out/{name}", "--parent", folder_in, "--name", name, timeout=300)
-
     log("DONE")
-    print("\n[run_daily] SUCCESS — adapter updated on Drive", flush=True)
+    print("\n[run_daily] SUCCESS — adapter + checkpoints on Drive", flush=True)
 
 
 if __name__ == "__main__":

@@ -83,7 +83,30 @@ SCOPE_DRIVE_FILE = "https://www.googleapis.com/auth/drive.file"
 # The gcloud CLI OAuth client whitelists drive.file (app-scoped: files the
 # app creates), which enables out-of-the-box operation on any gcloud
 # authenticated machine. Full-drive scope requires the Desktop OAuth client.
-ADC_PATH = Path(os.environ.get("GDRIVE_ADC", Path.home() / ".config/gcloud/application_default_credentials.json"))
+# GDRIVE_ADC may be a PATH to the ADC JSON *or* the inline JSON content
+# (e.g. a GitHub Actions secret) — inline content is materialized to the
+# default ADC path.
+def _resolve_adc_path():
+    raw = os.environ.get("GDRIVE_ADC", "")
+    default = Path.home() / ".config/gcloud/application_default_credentials.json"
+    if not raw:
+        return default
+    if raw.lstrip().startswith("{"):
+        try:
+            json.loads(raw)
+        except Exception:
+            return Path(raw)  # not JSON; treat as a path
+        default.parent.mkdir(parents=True, exist_ok=True)
+        default.write_text(raw, encoding="utf-8")
+        try:
+            os.chmod(default, 0o600)
+        except Exception:
+            pass
+        return default
+    return Path(raw)
+
+
+ADC_PATH = _resolve_adc_path()
 QUOTA_PROJECT = os.environ.get("GDRIVE_QUOTA_PROJECT", "")
 
 # MIME helpers
