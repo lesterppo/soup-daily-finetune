@@ -363,7 +363,7 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
             self.drive = drive_
             self.run_folder = run_folder_
 
-        def on_save(self, args, state, control):
+        def on_save(self, args, state, control, model=None, **kwargs):
             step = state.global_step
             ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
             if os.path.isdir(ckpt_dir) and os.path.exists(
@@ -379,7 +379,7 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
             self.start = time.time()
             self.timed_out = False
 
-        def on_step_end(self, args, state, control):
+        def on_step_end(self, args, state, control, model=None, **kwargs):
             if self.budget_s and time.time() - self.start > self.budget_s:
                 control.should_training_stop = True
                 if not self.timed_out:

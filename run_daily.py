@@ -132,7 +132,7 @@ def colab(*args, timeout=300):
 
 def poll_log(deadline, needle="[RESULT]"):
     while time.time() < deadline:
-        rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "8", timeout=60)
+        rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
         if needle in out or "EXIT" in out or "NOT FOUND" in out:
             return out
         if rc != 0:
@@ -140,6 +140,16 @@ def poll_log(deadline, needle="[RESULT]"):
             log(f"log poll rc={rc}: {err[-200:]}")
         time.sleep(90)
     return None
+
+
+def training_succeeded(final_log):
+    """A run is a SUCCESS only if the VM reported [RESULT] ok=true — the marker
+    daily_finetune.py prints AFTER the adapter passed verify_adapter() and the
+    Drive pushes completed. A bare 'EXIT 1' (e.g. a callback crash) must NOT be
+    treated as success; the old code did exactly that and shipped empty runs."""
+    if not final_log:
+        return False
+    return "[RESULT] ok=true" in final_log or "[RESULT] ok=True" in final_log
 
 
 def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
@@ -287,7 +297,14 @@ sys.exit(r.returncode)
         recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
-    log(f"training finished:\n{final[-1200:]}")
+    log(f"training log tail:\n{final[-2000:]}")
+    if not training_succeeded(final):
+        # Training ran but did NOT finish cleanly (callback crash, OOM, ...).
+        # Recover whatever checkpoint the VM pushed before dying so tomorrow
+        # resumes from real progress, then fail loudly — never report SUCCESS.
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit(f"training failed on the VM (no [RESULT] ok=true in log): {final[-800:]}")
 
     # --- download results (best-effort; Drive continuity is already done by VM) ---
     outdir = pathlib.Path("out")
