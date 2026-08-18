@@ -51,7 +51,7 @@ import urllib.request
 # run_daily.py lives in the same repo as daily_finetune.py — reuse its Drive
 # wrapper + checkpoint discovery instead of duplicating Drive logic.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from daily_finetune import Drive, find_latest_checkpoint  # noqa: E402
+from daily_finetune import Drive, find_latest_checkpoint, find_latest_archive  # noqa: E402
 
 TOKEN_FILE = pathlib.Path.home() / ".config" / "colab-cli" / "token.json"
 ADC_FILE = pathlib.Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
@@ -159,8 +159,15 @@ def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
     try:
         drive = Drive(GDRIVE_PY, str(ADC_FILE))
         found = find_latest_checkpoint(drive, os.environ.get("DRIVE_RESULTS", ""), run_id)
+        source = "checkpoint"
         if not found:
-            log("no Drive checkpoint found to recover")
+            arch = find_latest_archive(drive, os.environ.get("DRIVE_RESULTS", ""))
+            if arch:
+                folder_id, file_id, file_name, date = arch
+                found = (folder_id, 0, file_id, file_name)
+                source = f"archive results-{date}"
+        if not found:
+            log("no Drive checkpoint or archive found to recover")
             return False
         folder_id, step, file_id, file_name = found
         tmp = pathlib.Path("/tmp/ckpt_recover")
@@ -189,7 +196,7 @@ def recover_latest_checkpoint_to_adapter_in(folder_in, run_id):
         gdrive("upload", str(adapter), "--parent", folder_in, "--name", "adapter_model.safetensors", timeout=300)
         if cfg.exists():
             gdrive("upload", str(cfg), "--parent", folder_in, "--name", "adapter_config.json", timeout=120)
-        log(f"recovered checkpoint step-{step} -> adapter_in (next run resumes from it)")
+        log(f"recovered {source} step-{step} -> adapter_in (next run resumes from it)")
         return True
     except Exception as e:
         log(f"checkpoint recovery failed: {e}")
@@ -208,7 +215,11 @@ def main():
     save_steps = os.environ.get("RUN_SAVE_STEPS", "100")
     max_minutes = os.environ.get("RUN_MAX_MINUTES", "100")
     seed = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    run_id = seed
+    # UNIQUE run id (date+time): same-day re-runs must write into their OWN
+    # checkpoint folder. With a date-only run_id two runs collide on the same
+    # step-N filenames and find_latest_checkpoint can restore the OLD adapter
+    # on a tie (key > best[0] fails) — silently breaking continuity.
+    run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     # --- auth ---
     tok = mint_access_token(cid, csec, cref)

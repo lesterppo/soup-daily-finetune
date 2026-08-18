@@ -17,9 +17,10 @@ GitHub Actions (daily cron) ──► Google Colab T4 (train) ──► Google D
 3. It spins up a fresh free-Colab T4 session and runs `daily_finetune.py`.
 4. The VM **mounts Google Drive itself** (vendored `gdrive.py` + the gcloud ADC
    JSON, uploaded alongside the training script — headless, no browser) and
-   resumes from the **newest Drive checkpoint** found under
-   `results/checkpoints/` (falling back to the shared `adapter_in/` folder via
-   `gdown --folder` on the first run).
+   resumes from the **most-updated adapter on Drive**: newest step checkpoint
+   under `results/checkpoints/` (mid-run progress), falling back to the newest
+   dated archive `results/<date>/` (a completed fine-tuned model), then to the
+   shared `adapter_in/` folder via `gdown --folder` on the first run.
 5. Training continues fine-tuning on a fresh `gbharti/finance-alpaca` subset
    (seed = today's date, so each day trains on a different shuffle).
 6. **Every `--save-steps` training steps, the VM pushes a checkpoint to Drive**
@@ -55,12 +56,14 @@ timeouts, runner death, and Colab session recycling.
 the ADC JSON the orchestrator uploads; headless refresh-token OAuth, no
 browser). A `TrainerCallback` pushes a checkpoint to
 `results/checkpoints/<run-id>/step-<n>-adapter_model.safetensors` after every
-`--save-steps` training steps and prunes to the newest 2. On startup it scans
-all run folders under `results/checkpoints/` and resumes from the globally
-newest step. `--max-minutes` (default 100) makes the VM stop cleanly before the
-free-tier session recycle window and push a final checkpoint — so neither a
-GitHub Actions timeout (`timeout-minutes: 200`) nor a Colab recycle can lose
-more than `save_steps` steps of work.
+`--save-steps` training steps and prunes to the newest 2. `<run-id>` is unique
+per run (`YYYYMMDD-HHMMSS`), so same-day re-runs never collide on step numbers.
+On startup it scans all run folders under `results/checkpoints/` and resumes
+from the globally newest step (falling back to the newest dated archive if no
+checkpoints exist). `--max-minutes` (default 100) makes the VM stop cleanly
+before the free-tier session recycle window and push a final checkpoint — so
+neither a GitHub Actions timeout (`timeout-minutes: 200`) nor a Colab recycle
+can lose more than `save_steps` steps of work.
 
 ### VM-side auto-ship (`ship_to_drive.py`) — belt and suspenders
 

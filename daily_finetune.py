@@ -181,18 +181,53 @@ def find_latest_checkpoint(drive, results_folder, current_run_id):
     return folder_id, step, file_id, file_name
 
 
+def find_latest_archive(drive, results_folder):
+    """Return (folder_id, file_id, file_name, date) of the newest dated archive
+    (results-<date>/adapter_model.safetensors — a completed fine-tuned model),
+    or None. Used as a resume fallback when no step checkpoints exist."""
+    if not drive or not results_folder:
+        return None
+    best = None
+    for folder in drive.list_files(results_folder):
+        if folder.get("m") != drive.FOLDER_MIME:
+            continue
+        name = folder.get("n", "")
+        m = re.match(r"^results-(\d{4}-\d{2}-\d{2})$", name)
+        if not m:
+            continue
+        for f in drive.list_files(folder.get("id")):
+            if f.get("n") == "adapter_model.safetensors":
+                key = m.group(1)  # ISO date sorts lexicographically
+                if best is None or key > best[0]:
+                    best = (key, folder.get("id"), f.get("id"), f.get("n"))
+                break
+    if best is None:
+        return None
+    date, folder_id, file_id, file_name = best
+    print(f"[drive] newest archive: results-{date} ({file_name})", flush=True)
+    return folder_id, file_id, file_name, date
+
+
 def resume_from_drive(drive, results_folder, current_run_id, target_dir):
-    """Restore the newest Drive checkpoint into target_dir (as
-    adapter_model.safetensors + adapter_config.json). Returns target_dir on
-    success, else None."""
+    """Restore the most-updated adapter on Drive into target_dir (as
+    adapter_model.safetensors + adapter_config.json). Priority: newest step
+    checkpoint (mid-run progress) > newest dated archive (completed model).
+    Returns target_dir on success, else None."""
     found = find_latest_checkpoint(drive, results_folder, current_run_id)
+    source = "checkpoint"
+    if not found:
+        arch = find_latest_archive(drive, results_folder)
+        if arch:
+            folder_id, file_id, file_name, date = arch
+            found = (folder_id, 0, file_id, file_name)
+            source = f"archive results-{date}"
     if not found:
         return None
     folder_id, step, file_id, file_name = found
     os.makedirs(target_dir, exist_ok=True)
     out_path = os.path.join(target_dir, "adapter_model.safetensors")
     drive.download(file_id, out_path)
-    # config is constant — pull it if present in the same run folder
+    # config is constant — pull it if present in the same folder
     cfg = os.path.join(target_dir, "adapter_config.json")
     if not os.path.exists(cfg):
         for f in drive.list_files(folder_id):
@@ -200,7 +235,7 @@ def resume_from_drive(drive, results_folder, current_run_id, target_dir):
                 drive.download(f.get("id"), cfg)
                 break
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        print(f"[resume] restored Drive checkpoint step-{step} -> {target_dir}", flush=True)
+        print(f"[resume] CONTINUING from {source} (step-{step}, {file_name}) -> {target_dir}", flush=True)
         return target_dir
     return None
 
@@ -500,7 +535,10 @@ def main():
         print("[drive] WARNING: --drive-results given but no --gdrive-py/--adc-file — Drive sync disabled", flush=True)
 
     run_id = args.run_id or time.strftime("%Y%m%d")
-    date = time.strftime("%Y-%m-%d")
+    # date derived from run_id (runner-side UTC) so the archive folder name
+    # always matches the checkpoint run, regardless of VM local timezone
+    base = run_id[:8] if run_id and len(run_id) >= 8 else time.strftime("%Y%m%d")
+    date = f"{base[:4]}-{base[4:6]}-{base[6:8]}"
     _, run_folder = setup_checkpoints(drive, args.drive_results, run_id)
 
     # --- resume priority: Drive checkpoint > gdown adapter-in > fresh ---
