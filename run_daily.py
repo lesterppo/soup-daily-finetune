@@ -44,7 +44,9 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -86,6 +88,93 @@ TRAIN_TIMEOUT_S = train_timeout_s()
 # Drive checkpoint and fails fast instead of polling a corpse for the full
 # TRAIN_TIMEOUT budget.
 HEARTBEAT_STALL_S = 20 * 60
+
+# Colab idle-prunes free VM assignments with NO keep-alive ping. The colab-cli
+# spawns its own keep-alive daemon at `colab new`, but that daemon caches the
+# access token minted at startup (expires ~59 min) and dies with consecutive
+# 4xx — which is EXACTLY the ~60-min VM death observed across runs #12-14 and
+# the 2026-08-22 dispatch. We therefore run OUR OWN keep-alive loop inside the
+# runner's poll window, re-minting a fresh token every ping. This is the
+# deterministic fix for the "VM dies at step ~100 / 60 min" pattern.
+KEEP_ALIVE_INTERVAL_S = 60
+KEEP_ALIVE_URL = "https://colab.research.google.com/tun/m/{endpoint}/keep-alive/"
+KEEP_ALIVE_HEADERS = {
+    "X-Colab-Tunnel": "Google",
+    "Accept": "application/json",
+    "X-Colab-Client-Agent": "colab-cli",
+}
+
+
+def get_session_endpoint(session_name):
+    """Read the assignment endpoint for a session from the colab-cli registry."""
+    store_path = pathlib.Path.home() / ".config" / "colab-cli" / "sessions.json"
+    try:
+        store = json.loads(store_path.read_text())
+        for name, s in store.items():
+            if name == session_name and s.get("endpoint"):
+                return s["endpoint"]
+        # fall back: any entry whose name/endpoint matches the session
+        for name, s in store.items():
+            if s.get("endpoint") and (name == session_name or s.get("name") == session_name):
+                return s["endpoint"]
+    except Exception as e:
+        log(f"could not read session registry for endpoint: {e}")
+    return None
+
+
+def keep_alive_loop(endpoint, stop_event, cadence=KEEP_ALIVE_INTERVAL_S):
+    """Ping the Colab assignment keep-alive endpoint until stop_event is set.
+
+    Each ping mints a FRESH access token (never caches) so the loop outlives
+    the colab-cli daemon's token-expiry death. Read timeouts are expected
+    (TFE records activity before forwarding); only HTTP errors are surfaced.
+    """
+    while not stop_event.is_set():
+        try:
+            tok = mint_access_token(
+                os.environ.get("COLAB_CLIENT_ID", ""),
+                os.environ.get("COLAB_CLIENT_SECRET", ""),
+                os.environ.get("COLAB_REFRESH_TOKEN", ""),
+            )
+            token = tok.get("access_token", "")
+            url = KEEP_ALIVE_URL.format(endpoint=endpoint)
+            req = urllib.request.Request(
+                url + ("&" if "?" in url else "?") + "authuser=0",
+                headers={**KEEP_ALIVE_HEADERS, "Authorization": f"Bearer {token}"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+            log(f"keep-alive ping OK ({endpoint[:24]}...)")
+        except TimeoutError:
+            # Expected: TFE records the activity before forwarding to the VM,
+            # which often doesn't answer on this path. A read timeout means the
+            # keep-alive SUCCEEDED (this matches the official colab-cli client).
+            log(f"keep-alive ping recorded (read timeout = success) ({endpoint[:24]}...)")
+        except urllib.error.HTTPError as e:
+            # Real errors (404 deleted assignment, 4xx/5xx) — surface but keep
+            # trying; a few transient failures must not kill the loop.
+            log(f"keep-alive ping HTTP {e.code} (continuing): {str(e)[:120]}")
+        except Exception as e:
+            log(f"keep-alive ping failed (transient, continuing): {str(e)[:150]}")
+        stop_event.wait(cadence)
+
+
+def _start_keep_alive(session_name):
+    """Start the keep-alive thread for a session; returns the stop event or None."""
+    endpoint = get_session_endpoint(session_name)
+    if not endpoint:
+        log("keep-alive: no endpoint found in session registry — skipping (VM may be pruned at ~60 min)")
+        return None
+    ev = threading.Event()
+    t = threading.Thread(target=keep_alive_loop, args=(endpoint, ev), daemon=True)
+    t.start()
+    log(f"keep-alive loop started for endpoint {endpoint[:24]}... (ping every {KEEP_ALIVE_INTERVAL_S}s)")
+    return ev
+
+
+def _stop_keep_alive(stop_event):
+    if stop_event is not None:
+        stop_event.set()
+        log("keep-alive loop stopped")
 
 
 def log(msg):
@@ -299,7 +388,10 @@ def main():
             break
     if rc != 0:
         raise SystemExit(f"failed to create T4 session: {str(out)[-500:] or str(err)[-500:]}")
-
+    # Colab idle-prunes free VMs whose keep-alive dies (~60 min). The colab-cli's
+    # own daemon caches the startup token (expires ~59 min) and dies — we run our
+    # own ping loop for the whole poll window instead.
+    keep_alive_stop = _start_keep_alive(SESSION)
     # --- upload training script + Drive tooling to the VM ---
     for local, remote in [
         (str(REPO / "daily_finetune.py"), "/content/daily_finetune.py"),
@@ -351,6 +443,7 @@ sys.exit(r.returncode)
         # VM died mid-training (session recycled / OOM). Recover the newest
         # checkpoint so the next run resumes from real progress, fail fast.
         log("HEARTBEAT STALLED: VM appears dead — recovering latest checkpoint and stopping")
+        _stop_keep_alive(keep_alive_stop)
         recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit("VM heartbeat stalled (training died); latest Drive checkpoint recovered into adapter_in")
@@ -370,6 +463,7 @@ sys.exit(r.returncode)
         log("TIMEOUT: training did not finish in time (Colab may have recycled the session)")
         # The VM pushes checkpoints to Drive as it trains — recover the newest
         # one so the next run resumes from real progress, not the pre-run adapter.
+        _stop_keep_alive(keep_alive_stop)
         recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit("training timed out; latest Drive checkpoint recovered into adapter_in")
@@ -378,6 +472,7 @@ sys.exit(r.returncode)
         # Training ran but did NOT finish cleanly (callback crash, OOM, ...).
         # Recover whatever checkpoint the VM pushed before dying so tomorrow
         # resumes from real progress, then fail loudly — never report SUCCESS.
+        _stop_keep_alive(keep_alive_stop)
         recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
         colab("stop", "-s", SESSION, timeout=120)
         raise SystemExit(f"training failed on the VM (no [RESULT] ok=true in log): {final[-800:]}")
@@ -398,6 +493,7 @@ sys.exit(r.returncode)
         log("WARNING: adapter download failed — VM already pushed it to Drive (adapter_in + archive)")
 
     # --- stop session (free tier: don't leave it idle) ---
+    _stop_keep_alive(keep_alive_stop)
     colab("stop", "-s", SESSION, timeout=120)
 
     log("DONE")
