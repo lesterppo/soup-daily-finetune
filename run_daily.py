@@ -375,15 +375,31 @@ def main():
 
     # --- session (retry on transient quota exhaustion: free T4 quota is
     # ~3-4 sessions/account/day and `gpu-unavailable` is common at peak) ---
+    # First clean up any orphaned assignment from a previous run that was
+    # cancelled mid-flight (a cancelled GH run never ran `colab stop`, so the
+    # VM keeps occupying the account's concurrent-assignment slot and `new`
+    # fails with "Precondition Failed"). `recover` rebuilds the local registry
+    # from server-side list_assignments(), then `stop` releases the orphan.
+    log("pre-session cleanup: recovering any orphaned assignment on this account")
+    rc, out, err = colab("recover", timeout=120)
+    log(f"recover: rc={rc} {out[-160:]} {err[-160:]}")
+    rc, out, err = colab("stop", "-s", SESSION, timeout=120)
+    log(f"pre-clean stop: rc={rc} {out[-160:]} {err[-160:]}")
+
     rc, out, err = 1, "", ""
     for attempt in range(4):
         rc, out, err = colab("new", "-s", SESSION, "--gpu", "T4", timeout=300)
         log(f"new session attempt {attempt+1}: rc={rc} {out[-200:]} {err[-200:]}")
         if rc == 0:
             break
-        if "gpu-unavailable" in str(out) + str(err) and attempt < 3:
-            log("GPU quota exhausted — waiting 600s before retry")
-            time.sleep(600)
+        combined = str(out) + str(err)
+        if attempt < 3 and ("gpu-unavailable" in combined or "Precondition Failed" in combined or "too many" in combined.lower()):
+            log("GPU quota / assignment contention — cleaning orphans and waiting 300s before retry")
+            # Re-run the cleanup between attempts: a concurrent run (or a
+            # cancelled one still winding down) can hold the slot.
+            colab("recover", timeout=120)
+            colab("stop", "-s", SESSION, timeout=120)
+            time.sleep(300)
         else:
             break
     if rc != 0:
