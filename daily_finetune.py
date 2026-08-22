@@ -290,7 +290,7 @@ def push_archive(drive, results_folder, date, local_dir, metrics):
     folder = drive.ensure_folder(results_folder, f"results-{date}")
     if not folder:
         return
-    for name in ("adapter_model.safetensors", "adapter_config.json", "metrics.json"):
+    for name in ("adapter_model.safetensors", "adapter_config.json", "metrics.json", "loss_curve.json"):
         p = os.path.join(local_dir, name)
         if os.path.exists(p):
             drive.upload(p, folder, name)
@@ -407,6 +407,13 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                 push_checkpoint(self.drive, self.run_folder, step, ckpt_dir)
             elif os.path.exists(os.path.join(args.output_dir, "adapter_model.safetensors")):
                 push_checkpoint(self.drive, self.run_folder, step, args.output_dir)
+            # ship the loss curve with every checkpoint so even a killed run
+            # leaves a real training curve on Drive
+            curve = os.path.join(args.output_dir, "loss_curve.json")
+            if self.drive and self.run_folder and os.path.exists(curve):
+                r = self.drive.upload(curve, self.run_folder, "loss_curve.json")
+                if self.drive.is_ok(r):
+                    print(f"[drive] loss_curve.json pushed at step {step}", flush=True)
 
     class TimeBudgetCallback(TrainerCallback):
         def __init__(self, budget_s):
@@ -421,8 +428,23 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                     self.timed_out = True
                     print(f"[train] time budget ({self.budget_s}s) reached at step {state.global_step} — stopping", flush=True)
 
+    class LossCurveCallback(TrainerCallback):
+        """Record every logged (step, loss) and persist loss_curve.json after
+        each log so the curve survives VM death / runner timeout."""
+
+        def __init__(self, out_dir):
+            self.out_dir = out_dir
+            self.curve = []
+            self._path = os.path.join(out_dir, "loss_curve.json")
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and logs.get("loss") is not None:
+                self.curve.append({"step": int(state.global_step), "loss": float(logs["loss"])})
+                pathlib.Path(self._path).write_text(json.dumps(self.curve))
+
     budget = TimeBudgetCallback(max_minutes * 60 if max_minutes and max_minutes > 0 else 0)
-    callbacks = [budget]
+    curve_cb = LossCurveCallback(out_dir)
+    callbacks = [budget, curve_cb]
     if drive and run_folder:
         callbacks.append(DriveCheckpointCallback(drive, run_folder))
 
@@ -473,14 +495,18 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
         if h.get("loss") is not None:
             last_loss = float(h["loss"])
             break
+    # full loss curve: every logged (step, loss) — the real training curve
+    curve = [{"step": c["step"], "loss": c["loss"]} for c in curve_cb.curve]
     metrics = {
         "train_runtime_s": round(dt, 1),
         "train_samples": len(ds),
         "train_steps": steps,
         "partial": partial,
         "train_loss": round(last_loss, 4) if last_loss is not None else None,
+        "loss_curve": curve,
     }
     pathlib.Path(out_dir, "metrics.json").write_text(json.dumps(metrics, indent=2))
+    pathlib.Path(out_dir, "loss_curve.json").write_text(json.dumps(curve))
     print(f"[metrics] {json.dumps(metrics)}", flush=True)
 
     # final checkpoint push (step = current global_step)

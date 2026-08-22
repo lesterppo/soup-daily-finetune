@@ -15,9 +15,9 @@ on:
         required: false
         default: "100"
       max_minutes:
-        description: "Stop training after N minutes and save a final checkpoint (0 = unlimited)"
+        description: "Stop training after N minutes and save a final checkpoint (0 = unlimited). 240 covers a full 2000-row epoch (~500 steps at ~20s/step + setup)."
         required: false
-        default: "100"
+        default: "240"
       train_timeout:
         description: "Runner poll budget in minutes (default: max_minutes + 25; unlimited mode: 240)"
         required: false
@@ -79,7 +79,7 @@ jobs:
           DRIVE_RESULTS: ${{ secrets.DRIVE_RESULTS }}
           RUN_ROWS: ${{ github.event.inputs.rows || '2000' }}
           RUN_SAVE_STEPS: ${{ github.event.inputs.save_steps || '100' }}
-          RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '100' }}
+          RUN_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '240' }}
           RUN_EPOCHS: ${{ github.event.inputs.epochs || '1' }}
           # Optional runner poll budget override in MINUTES (default in
           # run_daily.py: max_minutes + 25). Must outlive the VM's setup

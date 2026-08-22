@@ -36,7 +36,7 @@ Environment:
   DRIVE_RESULTS           Drive folder id for dated result archives + checkpoints/
   RUN_ROWS                finance-alpaca subset size per day (default 5000)
   RUN_SAVE_STEPS          checkpoint every N training steps (default 100)
-  RUN_MAX_MINUTES         stop training after N minutes, save final checkpoint (default 100)
+  RUN_MAX_MINUTES         stop training after N minutes, save final checkpoint (default 240 — covers a full 2000-row epoch)
 """
 import datetime
 import json
