@@ -90,13 +90,76 @@ def install_deps():
 # ---------------------------------------------------------------------------
 
 class Drive:
-    """Thin wrapper around the vendored gdrive.py CLI for checkpoint sync."""
+    """Thin wrapper around Google Drive for checkpoint sync.
+
+    Uploads use an IN-PROCESS googleapiclient client (built once, reused) to
+    avoid spawning a full `gdrive.py` subprocess (python + googleapiclient
+    import ≈ 200MB transient RAM spike) per checkpoint push — that spike right
+    after the step-100 save is the suspected OOM trigger in Colab's ~12GB RAM
+    cgroup. Falls back to the vendored gdrive.py CLI if the in-process path
+    can't initialize.
+    """
 
     FOLDER_MIME = "application/vnd.google-apps.folder"
+    SCOPE = "https://www.googleapis.com/auth/drive.file"
 
     def __init__(self, gdrive_py, adc_file):
         self.gdrive = gdrive_py
+        self.adc_file = adc_file
         self.env = {**os.environ, "GDRIVE_ADC": adc_file}
+        self._api = None
+        self._media = None
+
+    def _get_api(self):
+        """Lazily build an in-process Drive service from the ADC (no subprocess)."""
+        if self._api is not None:
+            return self._api
+        try:
+            import json as _json
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+
+            data = _json.loads(pathlib.Path(self.adc_file).read_text())
+            if data.get("type") != "authorized_user":
+                return None
+            creds = Credentials(
+                token=None,
+                refresh_token=data.get("refresh_token"),
+                token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
+                client_id=data.get("client_id"),
+                client_secret=data.get("client_secret"),
+                scopes=[self.SCOPE],
+            )
+            creds.refresh(Request())
+            self._api = build("drive", "v3", credentials=creds, cache_discovery=False)
+            self._media = MediaFileUpload
+        except Exception as e:
+            print(f"[drive] in-process API unavailable ({str(e)[:120]}) — falling back to gdrive.py subprocess", flush=True)
+            self._api = False  # sentinel: don't retry every call
+        return self._api if self._api else None
+
+    def upload(self, local, folder, name, timeout=600):
+        """Upload a file. Prefers in-process API; falls back to gdrive.py CLI."""
+        api = self._get_api()
+        if api is not None:
+            try:
+                import mimetypes
+                mime = mimetypes.guess_type(str(local))[0] or "application/octet-stream"
+                media = self._media(
+                    str(local), mimetype=mime, resumable=os.path.getsize(local) > 8 * 1024 * 1024,
+                    chunksize=8 * 1024 * 1024,
+                )
+                body = {"name": name, "parents": [folder]}
+                req = api.files().create(body=body, media_body=media,
+                                         fields="id,name,size", supportsAllDrives=True)
+                resp = req.execute()
+                print(f"[drive] uploaded {name} via in-process API ({resp.get('size')} bytes)", flush=True)
+                return {"ok": True, "id": resp.get("id"), "name": resp.get("name")}
+            except Exception as e:
+                print(f"[drive] in-process upload failed ({str(e)[:150]}) — falling back to gdrive.py", flush=True)
+        return self._call("upload", local, "--parent", folder, "--name", name, timeout=timeout)
 
     def _call(self, *args, timeout=300):
         try:
@@ -127,9 +190,6 @@ class Drive:
     def list_files(self, folder, max_n=200):
         lst = self._call("list", "--folder", folder, "--max", str(max_n))
         return lst.get("items", []) if self.is_ok(lst) else []
-
-    def upload(self, local, folder, name, timeout=600):
-        return self._call("upload", local, "--parent", folder, "--name", name, timeout=timeout)
 
     def rm(self, fid):
         return self._call("rm", fid, timeout=120)
@@ -442,9 +502,35 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
                 self.curve.append({"step": int(state.global_step), "loss": float(logs["loss"])})
                 pathlib.Path(self._path).write_text(json.dumps(self.curve))
 
+    class HeartbeatCallback(TrainerCallback):
+        """Emit a `[alive] step=N loss=X ram=Y` line every `every` steps with
+        flush=True so the runner can see training is progressing and detect a
+        dead VM early (no new [alive] for N min = something died). RAM read
+        from /proc/meminfo (free Colab cgroup is ~12GB)."""
+
+        def __init__(self, every=10):
+            self.every = every
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if state.global_step % self.every != 0:
+                return
+            loss = logs.get("loss") if logs else None
+            ram = ""
+            try:
+                total = avail = 0
+                for line in open("/proc/meminfo"):
+                    if line.startswith("MemTotal:"):
+                        total = int(line.split()[1]) / 1024 / 1024
+                    elif line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) / 1024 / 1024
+                ram = f"{total - avail:.1f}/{total:.1f}GB"
+            except Exception:
+                pass
+            print(f"[alive] step={state.global_step} loss={loss} ram={ram}", flush=True)
+
     budget = TimeBudgetCallback(max_minutes * 60 if max_minutes and max_minutes > 0 else 0)
     curve_cb = LossCurveCallback(out_dir)
-    callbacks = [budget, curve_cb]
+    callbacks = [budget, curve_cb, HeartbeatCallback(every=10)]
     if drive and run_folder:
         callbacks.append(DriveCheckpointCallback(drive, run_folder))
 
@@ -457,6 +543,11 @@ def train(model, tok, data_path: str, out_dir: str, save_steps: int,
         logging_steps=10,
         save_steps=save_steps,
         save_strategy="steps",
+        # model-only checkpoints: no optimizer.pt/scheduler.pt/rng_state (~500MB
+        # of writes per save). The full checkpoint write at step 100 is the
+        # suspected OOM trigger that kills the 12GB Colab RAM cgroup right after
+        # the first Drive push; save_only_model cuts it to the ~80MB adapter.
+        save_only_model=True,
         fp16=False,
         bf16=True,
         optim="adamw_torch",

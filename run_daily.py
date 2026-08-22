@@ -80,6 +80,13 @@ def train_timeout_s():
 
 TRAIN_TIMEOUT_S = train_timeout_s()
 
+# If no new [alive] heartbeat for this long, the VM is dead (session recycled /
+# OOM-killed). Daily_finetune.py emits one every 10 steps (~3-4 min at 20s/step),
+# so 20 min without progress = definitely dead. The runner recovers the latest
+# Drive checkpoint and fails fast instead of polling a corpse for the full
+# TRAIN_TIMEOUT budget.
+HEARTBEAT_STALL_S = 20 * 60
+
 
 def log(msg):
     print(f"[run_daily] {msg}", flush=True)
@@ -146,10 +153,31 @@ def colab(*args, timeout=300):
 
 
 def poll_log(deadline, needle="[RESULT]"):
+    last_alive_step = -1
+    last_alive_at = None
     while time.time() < deadline:
         rc, out, err = colab("logs", "-s", SESSION, "/content/train.log", "-n", "12", timeout=60)
         if needle in out or "EXIT" in out or "NOT FOUND" in out:
             return out
+        # heartbeat stall detection: daily_finetune.py emits [alive] step=N every
+        # 10 steps. If we've seen a heartbeat but the newest one hasn't advanced
+        # for HEARTBEAT_STALL_MIN, the VM is dead (session recycled / OOM-killed)
+        # and the runner should recover the latest checkpoint and fail FAST
+        # instead of polling a corpse until the full timeout budget.
+        import re as _re
+        m = _re.findall(r"\[alive\] step=(\d+)", out)
+        if m:
+            cur = max(int(x) for x in m)
+            if cur > last_alive_step:
+                last_alive_step = cur
+                last_alive_at = time.time()
+            elif last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
+                log(f"HEARTBEAT STALLED: newest [alive] step={cur} unchanged for {HEARTBEAT_STALL_S}s — VM likely dead")
+                return "HEARTBEAT_STALLED"
+        elif rc != 0 and last_alive_at is not None and time.time() - last_alive_at > HEARTBEAT_STALL_S:
+            # log unreadable AND we had a heartbeat before — treat as dead
+            log(f"HEARTBEAT STALLED: log unreadable (rc={rc}) and no new [alive] for {HEARTBEAT_STALL_S}s")
+            return "HEARTBEAT_STALLED"
         if rc != 0:
             # transient colab flakiness — keep polling
             log(f"log poll rc={rc}: {err[-200:]}")
@@ -319,6 +347,13 @@ sys.exit(r.returncode)
     deadline = time.time() + TRAIN_TIMEOUT_S
     log(f"polling /content/train.log until {datetime.datetime.now().isoformat()} + {TRAIN_TIMEOUT_S}s")
     final = poll_log(deadline)
+    if final == "HEARTBEAT_STALLED":
+        # VM died mid-training (session recycled / OOM). Recover the newest
+        # checkpoint so the next run resumes from real progress, fail fast.
+        log("HEARTBEAT STALLED: VM appears dead — recovering latest checkpoint and stopping")
+        recover_latest_checkpoint_to_adapter_in(folder_in, run_id)
+        colab("stop", "-s", SESSION, timeout=120)
+        raise SystemExit("VM heartbeat stalled (training died); latest Drive checkpoint recovered into adapter_in")
     if final is None:
         if unlimited:
             # max_minutes=0: the VM self-stops only when the Colab session is
